@@ -1,0 +1,100 @@
+# Внешняя проверка домашнего сервера: раз в 5 минут GitHub обращается к сайтам снаружи.
+# Если не отвечает ни один адрес (мини-ПК выключен или пропал домашний интернет) — тревога в ntfy,
+# когда снова отвечает — сообщение о восстановлении.
+# Адреса и тема ntfy хранятся в секретах репозитория (CHECK_URLS — по одному адресу на строку, NTFY_TOPIC).
+name: uptime
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+    # раз в неделю продлеваем работу расписания: GitHub выключает его в репозитории без активности за 60 дней
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+    inputs:
+      test:
+        description: 'Отправить тестовое уведомление'
+        type: boolean
+        default: false
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Предыдущее состояние
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: uptime-state-${{ github.run_id }}
+          restore-keys: uptime-state-
+
+      - name: Проверка
+        env:
+          CHECK_URLS: ${{ secrets.CHECK_URLS }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          TEST: ${{ inputs.test }}
+        run: |
+          mkdir -p state
+          notify() {  # заголовок, текст, приоритет, тег
+            [ -n "$NTFY_TOPIC" ] || { echo "NTFY_TOPIC не задан"; return 0; }
+            jq -n --arg t "$NTFY_TOPIC" --arg ti "$1" --arg m "$2" --argjson p "$3" --arg tag "$4" \
+              '{topic:$t,title:$ti,message:$m,priority:$p,tags:[$tag]}' \
+              | curl -s -o /dev/null -m 15 --retry 2 -H 'Content-Type: application/json' -d @- https://ntfy.sh/ || true
+          }
+          now=$(date +%s); msk() { TZ=Europe/Moscow date -d "@$1" '+%d.%m %H:%M'; }
+
+          if [ "$TEST" = "true" ]; then
+            notify "Внешняя проверка: тест" "GitHub Actions может отправлять тревоги в эту тему" 3 white_check_mark
+          fi
+
+          # сервер жив, если отвечает хотя бы один адрес; 3 попытки с паузой, чтобы не тревожить из-за разовых сбоев
+          ok=0
+          for attempt in 1 2 3; do
+            i=0
+            while IFS= read -r url; do
+              url=$(echo "$url" | tr -d '[:space:]'); [ -n "$url" ] || continue
+              i=$((i+1))
+              code=$(curl -s -o /dev/null -m 20 -w '%{http_code}' "$url" || true)
+              echo "попытка $attempt, адрес $i: $code"
+              case "$code" in 2*|3*) ok=1 ;; esac
+            done <<< "$CHECK_URLS"
+            [ "$ok" = 1 ] && break
+            [ "$attempt" -lt 3 ] && sleep 30
+          done
+
+          prev=$(cat state/status 2>/dev/null || echo "up")
+          if [ "$ok" = 1 ]; then
+            if [ "${prev%% *}" = "down" ]; then
+              since=${prev#down }
+              notify "Сервер снова доступен" "Не отвечал с $(msk "$since") (МСК), примерно $(( (now - since) / 60 )) мин." 4 white_check_mark
+            fi
+            echo "up" > state/status
+            echo "Сервер доступен"
+          else
+            if [ "${prev%% *}" != "down" ]; then
+              notify "Сервер недоступен" "Снаружи не отвечает ни один сайт с $(msk "$now") (МСК). Возможно, мини-ПК выключен или пропал домашний интернет." 5 rotating_light
+              echo "down $now" > state/status
+            fi
+            echo "Сервер НЕ доступен"
+          fi
+
+      - name: Сохранить состояние
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: uptime-state-${{ github.run_id }}
+
+      - name: Продлить расписание
+        if: github.event.schedule == '17 3 * * 1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/uptime.yml/enable"
